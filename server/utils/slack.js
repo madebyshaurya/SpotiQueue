@@ -80,19 +80,19 @@ async function handleApprove(prequeueId, userId, responseUrl) {
     const trackInfo = await getTrack(prequeue.track_id);
     await addToQueue(trackInfo.uri);
     
-    // Update prequeue status
-    db.prepare('UPDATE prequeue SET status = ? WHERE id = ?').run('approved', prequeueId);
-    
+    // Update prequeue status with approver
+    db.prepare('UPDATE prequeue SET status = ?, approved_by = ? WHERE id = ?').run('approved', userId, prequeueId);
+
     // Log queue attempt
     const now = Math.floor(Date.now() / 1000);
     db.prepare(`
       INSERT INTO queue_attempts (fingerprint_id, track_id, track_name, artist_name, status, timestamp)
       VALUES (?, ?, ?, ?, ?, ?)
     `).run(prequeue.fingerprint_id, prequeue.track_id, prequeue.track_name, prequeue.artist_name, 'success', now);
-    
+
     // Send response
     await axios.post(responseUrl, {
-      text: `✅ Approved: ${prequeue.track_name} by ${prequeue.artist_name}`,
+      text: `✅ Approved by <@${userId}>: ${prequeue.track_name} by ${prequeue.artist_name}`,
       replace_original: true
     });
     
@@ -130,12 +130,12 @@ async function handleDecline(prequeueId, userId, responseUrl) {
       return;
     }
     
-    // Update prequeue status
-    db.prepare('UPDATE prequeue SET status = ? WHERE id = ?').run('declined', prequeueId);
-    
+    // Update prequeue status with decliner
+    db.prepare('UPDATE prequeue SET status = ?, approved_by = ? WHERE id = ?').run('declined', userId, prequeueId);
+
     // Send response
     await axios.post(responseUrl, {
-      text: `❌ Declined: ${prequeue.track_name} by ${prequeue.artist_name}`,
+      text: `❌ Declined by <@${userId}>: ${prequeue.track_name} by ${prequeue.artist_name}`,
       replace_original: true
     });
     

@@ -62,6 +62,35 @@ router.post('/submit', userAuthMiddleware, async (req, res) => {
     // Get track info
     const trackInfo = await getTrack(trackId);
 
+    // Check song duration limit
+    const maxDuration = parseInt(getConfig('max_song_duration') || '0');
+    if (maxDuration > 0 && trackInfo.duration_ms > maxDuration * 1000) {
+      const maxMins = Math.floor(maxDuration / 60);
+      const maxSecs = maxDuration % 60;
+      return res.status(403).json({ error: `Song is too long. Maximum duration is ${maxMins}:${String(maxSecs).padStart(2, '0')}.` });
+    }
+
+    // Check for duplicate in current queue
+    try {
+      const { getQueue } = require('../utils/spotify');
+      const currentQueue = await getQueue();
+      const isDuplicate = currentQueue.queue.some(track => track.id === trackId) ||
+        (currentQueue.currently_playing && currentQueue.currently_playing.id === trackId);
+      if (isDuplicate) {
+        return res.status(409).json({ error: 'This song is already in the queue or currently playing.' });
+      }
+    } catch (queueErr) {
+      console.warn('Could not check queue for duplicates:', queueErr.message);
+    }
+
+    // Check for duplicate in pending prequeue
+    const existingPending = db.prepare(
+      "SELECT * FROM prequeue WHERE track_id = ? AND status = 'pending'"
+    ).get(trackId);
+    if (existingPending) {
+      return res.status(409).json({ error: 'This song is already pending approval.' });
+    }
+
     // Create prequeue entry
     const prequeueId = crypto.randomBytes(8).toString('hex');
     const now = Math.floor(Date.now() / 1000);
@@ -118,7 +147,7 @@ router.post('/approve/:prequeueId', async (req, res) => {
     await addToQueue(trackInfo.uri);
 
     // Update prequeue status
-    db.prepare('UPDATE prequeue SET status = ? WHERE id = ?').run('approved', prequeueId);
+    db.prepare('UPDATE prequeue SET status = ?, approved_by = ? WHERE id = ?').run('approved', req.body.approved_by || 'admin', prequeueId);
 
     // Log queue attempt
     const now = Math.floor(Date.now() / 1000);
@@ -154,7 +183,7 @@ router.post('/decline/:prequeueId', async (req, res) => {
     }
 
     // Update prequeue status
-    db.prepare('UPDATE prequeue SET status = ? WHERE id = ?').run('declined', prequeueId);
+    db.prepare('UPDATE prequeue SET status = ?, approved_by = ? WHERE id = ?').run('declined', req.body.approved_by || 'admin', prequeueId);
 
     res.json({
       success: true,

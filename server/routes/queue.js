@@ -80,6 +80,12 @@ router.post('/search', userAuthMiddleware, async (req, res) => {
     if (banExplicit) {
       tracks = tracks.filter(track => !track.explicit);
     }
+
+    // Filter out tracks exceeding duration limit
+    const maxDuration = parseInt(getConfig('max_song_duration') || '0');
+    if (maxDuration > 0) {
+      tracks = tracks.filter(track => track.duration_ms <= maxDuration * 1000);
+    }
     
     res.json({ tracks });
   } catch (error) {
@@ -217,7 +223,7 @@ router.post('/add', userAuthMiddleware, async (req, res) => {
   try {
     // Get track info
     trackInfo = await getTrack(trackId);
-    
+
     // Check if explicit songs are banned
     const banExplicit = getConfig('ban_explicit') === 'true';
     if (banExplicit && trackInfo.explicit) {
@@ -225,10 +231,41 @@ router.post('/add', userAuthMiddleware, async (req, res) => {
         INSERT INTO queue_attempts (fingerprint_id, track_id, track_name, artist_name, status, error_message, timestamp)
         VALUES (?, ?, ?, ?, ?, ?, ?)
       `).run(fingerprintId, trackId, trackInfo.name, trackInfo.artists, 'blocked', 'Explicit content not allowed', now);
-      
+
       return res.status(403).json({ error: 'Explicit songs are not allowed.' });
     }
-    
+
+    // Check song duration limit
+    const maxDuration = parseInt(getConfig('max_song_duration') || '0');
+    if (maxDuration > 0 && trackInfo.duration_ms > maxDuration * 1000) {
+      const maxMins = Math.floor(maxDuration / 60);
+      const maxSecs = maxDuration % 60;
+      db.prepare(`
+        INSERT INTO queue_attempts (fingerprint_id, track_id, track_name, artist_name, status, error_message, timestamp)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(fingerprintId, trackId, trackInfo.name, trackInfo.artists, 'blocked', 'Song exceeds duration limit', now);
+
+      return res.status(403).json({ error: `Song is too long. Maximum duration is ${maxMins}:${String(maxSecs).padStart(2, '0')}.` });
+    }
+
+    // Check for duplicate in current queue
+    try {
+      const currentQueue = await getQueue();
+      const isDuplicate = currentQueue.queue.some(track => track.id === trackId) ||
+        (currentQueue.currently_playing && currentQueue.currently_playing.id === trackId);
+      if (isDuplicate) {
+        db.prepare(`
+          INSERT INTO queue_attempts (fingerprint_id, track_id, track_name, artist_name, status, error_message, timestamp)
+          VALUES (?, ?, ?, ?, ?, ?, ?)
+        `).run(fingerprintId, trackId, trackInfo.name, trackInfo.artists, 'blocked', 'Song already in queue', now);
+
+        return res.status(409).json({ error: 'This song is already in the queue.' });
+      }
+    } catch (queueErr) {
+      // If we can't check the queue, allow the song through
+      console.warn('Could not check queue for duplicates:', queueErr.message);
+    }
+
     // Add to Spotify queue
     await addToQueue(trackInfo.uri);
     
@@ -296,5 +333,109 @@ router.post('/add', userAuthMiddleware, async (req, res) => {
   }
 });
 
-module.exports = router;
+// Vote for a track in the queue
+router.post('/vote', userAuthMiddleware, (req, res) => {
+  const db = getDb();
+  const { track_id } = req.body;
+  const fingerprintId = req.body.fingerprint_id || req.cookies.fingerprint_id;
 
+  if (!track_id) {
+    return res.status(400).json({ error: 'Track ID required' });
+  }
+
+  if (!fingerprintId) {
+    return res.status(400).json({ error: 'Fingerprint required' });
+  }
+
+  try {
+    // Check if already voted
+    const existing = db.prepare(
+      'SELECT id FROM votes WHERE track_id = ? AND fingerprint_id = ?'
+    ).get(track_id, fingerprintId);
+
+    if (existing) {
+      // Remove vote (toggle)
+      db.prepare('DELETE FROM votes WHERE track_id = ? AND fingerprint_id = ?').run(track_id, fingerprintId);
+      const count = db.prepare('SELECT COUNT(*) as count FROM votes WHERE track_id = ?').get(track_id);
+      return res.json({ voted: false, votes: count ? count.count : 0 });
+    }
+
+    // Add vote
+    const now = Math.floor(Date.now() / 1000);
+    db.prepare(
+      'INSERT INTO votes (track_id, fingerprint_id, created_at) VALUES (?, ?, ?)'
+    ).run(track_id, fingerprintId, now);
+
+    const count = db.prepare('SELECT COUNT(*) as count FROM votes WHERE track_id = ?').get(track_id);
+    res.json({ voted: true, votes: count ? count.count : 0 });
+  } catch (error) {
+    console.error('Vote error:', error);
+    res.status(500).json({ error: 'Failed to vote' });
+  }
+});
+
+// Get votes for all tracks (or specific track)
+router.get('/votes', userAuthMiddleware, (req, res) => {
+  const db = getDb();
+  const fingerprintId = req.query.fingerprint_id || req.cookies.fingerprint_id;
+
+  try {
+    // Get all vote counts
+    const voteCounts = db.prepare(
+      'SELECT track_id, COUNT(*) as count FROM votes GROUP BY track_id'
+    ).all();
+
+    const votes = {};
+    voteCounts.forEach(row => {
+      votes[row.track_id] = row.count;
+    });
+
+    // Get user's votes if fingerprint provided
+    let userVotes = [];
+    if (fingerprintId) {
+      userVotes = db.prepare(
+        'SELECT track_id FROM votes WHERE fingerprint_id = ?'
+      ).all(fingerprintId).map(row => row.track_id);
+    }
+
+    res.json({ votes, userVotes });
+  } catch (error) {
+    console.error('Get votes error:', error);
+    res.json({ votes: {}, userVotes: [] });
+  }
+});
+
+
+// GET /api/queue/recent-activity
+// Returns last 15 successful queue events for the activity feed
+router.get('/recent-activity', (req, res) => {
+  try {
+    const db = getDb()
+    const rows = db.prepare(`
+      SELECT
+        qa.track_name,
+        qa.artist_name,
+        f.username,
+        qa.timestamp
+      FROM queue_attempts qa
+      LEFT JOIN fingerprints f ON qa.fingerprint_id = f.id
+      WHERE qa.status = 'success' AND qa.track_name IS NOT NULL
+      ORDER BY qa.timestamp DESC
+      LIMIT 15
+    `).all()
+
+    const activity = rows.map(row => ({
+      track_name: row.track_name,
+      artist_name: row.artist_name,
+      username: row.username || null,
+      timestamp: row.timestamp
+    }))
+
+    res.json({ activity })
+  } catch (error) {
+    console.error('Activity feed error:', error)
+    res.json({ activity: [] })
+  }
+})
+
+module.exports = router;

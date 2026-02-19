@@ -11,6 +11,7 @@ const nowPlayingRouter = require('./routes/nowPlaying');
 const adminRouter = require('./routes/admin');
 const configRouter = require('./routes/config');
 const authRouter = require('./routes/auth');
+const githubAuthRouter = require('./routes/github-auth');
 const { initDatabase } = require('./db');
 const { initSlackSocketMode } = require('./utils/slack');
 
@@ -62,6 +63,7 @@ async function startServer() {
     app.use('/api/admin', adminRouter);
     app.use('/api/config', configRouter);
     app.use('/api/auth', authRouter);
+    app.use('/api/github', githubAuthRouter);
 
     // Root route - helpful message in development
     if (!isProduction) {
@@ -114,9 +116,9 @@ async function startServer() {
 
     // Serve static files in production only
     if (isProduction) {
-      app.use(express.static(path.join(__dirname, '../client/build')));
+      app.use(express.static(path.join(__dirname, '../client/dist')));
       app.get('*', (req, res) => {
-        res.sendFile(path.join(__dirname, '../client/build/index.html'));
+        res.sendFile(path.join(__dirname, '../client/dist/index.html'));
       });
     }
 
